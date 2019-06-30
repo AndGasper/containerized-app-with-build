@@ -1,0 +1,4 @@
+{
+    "app": "node ./aws/build/index.js",
+    "outDir": "./template-output"
+}
