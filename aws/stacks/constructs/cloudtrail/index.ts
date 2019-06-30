@@ -1,5 +1,8 @@
+import { Construct, Aws } from '@aws-cdk/core';
+import { CfnDeliveryStream } from '@aws-cdk/aws-kinesisfirehose';
+import { Role, RoleProps, ServicePrincipal, Policy, PolicyProps } from '@aws-cdk/aws-iam';
+import { LogGroup, SubscriptionFilter, FilterPattern, SubscriptionFilterOptions } from '@aws-cdk/aws-logs';
 import { Trail } from '@aws-cdk/aws-cloudtrail';
-import { Construct } from '@aws-cdk/core';
 import { Bucket, BlockPublicAccess } from '@aws-cdk/aws-s3';
 import { Key, IKey } from '@aws-cdk/aws-kms';
 import { PolicyDocument, PolicyStatement, AccountPrincipal, ArnPrincipal } from '@aws-cdk/aws-iam';
@@ -11,37 +14,158 @@ export interface CloudTrailProps {
     kmsAdminUserArn: string;
 }
 
-export class CloudTrail extends Construct {
-    constructor(parent: Construct, name: string, props: CloudTrailProps) {
-        super(parent, name);
+export interface LogsProps {
+    logBucketName: string;
+}
+
+export class KinesisStreamLogGroup extends Construct {
+    constructor(parent: Construct, name: string, props: LogsProps) {
+        super(parent, name); 
         const {
-            logBucketName,
-            trailName,
-            trailKmsName,
-            kmsAdminUserArn
+            logBucketName
         } = props;
-        const logBucket = this.createS3TrailBucket(logBucketName);
-        const kmsIamPolicy = this.createKmsAdminPolicy(kmsAdminUserArn);
-        const trailKms = this.createTrailKms(trailKmsName, kmsIamPolicy);
-        const trail = this.createCloudTrail(trailName, trailKms);
+        const logBucket = this.createLogBucket(logBucketName);
+        const kinesisFireHoseRole = this.createKinesisFireHoseRole(); 
+        // inherent danger in creating a policy 
+        const logDeliveryToS3Policy = this.createLogDeliveryToS3Policy(logBucket);
+        // attach the log delivery policy to the kinesisFireHoseRole
+        logDeliveryToS3Policy.attachToRole(kinesisFireHoseRole)
+        const deliveryStream = this.createDeliveryStream(logBucket["bucketArn"], kinesisFireHoseRole.roleArn);
+        const logGroup = this.createLogGroup(logBucketName, logBucket);
+        const logGroupSubsscriptionFilter = new SubscriptionFilter(this, 'subscription-filter', {});
+        logGroup.addSubscriptionFilter('log-group-stream-filter', logGroupSubsscriptionFilter);
+
+    }
+    /**
+     * @name createLogGroup
+     * @param { String } logBucketName - Use the log bucket's name for the log group name (meh)
+     * @param { Bucket } logBucket, - the bucket to send the logs to
+     * @description - Crate the log group 
+     */
+    private createLogGroup(logBucketName: string, logBucket: Bucket) {
+        // implicit formatting assumption;
+        // use the (then) default retention policy of 2 years
+        const logGroup = new LogGroup(this, `log-group-${logBucketName}`, {});
+        return logGroup;
     }
     /**
      * @name createS3TrailBucket
      * @param {String} logBucketName
      * @description - Create the s3 bucket used for storing the cloudtrail logs
-     * @return {Bucket} logBucket - 
+     * @return {Bucket} logBucket - Bucket for logs 
      */
-    private createS3TrailBucket(logBucketName: string) {
+    private createLogBucket(logBucketName: string) {
         const logBucket = new Bucket(this, logBucketName, {
             blockPublicAccess: new BlockPublicAccess({
                 blockPublicAcls: true,
                 blockPublicPolicy: true,
                 ignorePublicAcls: true,
                 restrictPublicBuckets: true
-            })
+            }), 
+            versioned: true
         });
         return logBucket;
     }
+    /**
+     * @name createLogDeliveryToS3Policy
+     * @param {Bucket} logBucket - S3 Log Bucket
+     * @description - Create the log delivery policy
+     * @return {Policy} - firehose_delivery_policy
+     */
+    private createLogDeliveryToS3Policy(logBucket: Bucket) {
+        const logDeliveryToS3Staement = new PolicyStatement({
+            actions: [
+                "s3:AbortMultipartUpload",
+                "s3:GetBucketLocation",
+                "s3:GetObject",
+                "s3:ListBucket",
+                "s3:ListBucketMultipartUploads",
+                "s3:PutObject"
+            ],
+            resources: [
+                logBucket.bucketArn,
+                logBucket.arnForObjects("firehose/")
+            ]  
+        });
+        // abstract out to logObjectPrefix?
+        // // tighten up principals
+        const logDeliveryToS3PolicyProps: PolicyProps = {
+            policyName: 'firehose_delivery_policy',
+            statements: [ logDeliveryToS3Staement ],
+        };
+        const logDeliveryToS3Policy = new Policy(this, 'firehose_delivery_policy', logDeliveryToS3PolicyProps);
+        return logDeliveryToS3Policy
+    }
+    /**
+     * @name createKinesisFireHoseRole
+     * @return kinesisFireHoseRole - AssumeRole for kinesis firehose
+     */
+    private createKinesisFireHoseRole() {
+        const kinesisFireHoseRoleProps: RoleProps = {
+            assumedBy: new ServicePrincipal("firehose.amazonaws.com", {
+                conditions: {
+                    "StringEquals": [
+                        {
+                            "sts:ExternalId": Aws.ACCOUNT_ID
+                        }
+                    ]
+                }
+            })
+        };
+        // PolicyDocument
+        const kinesisFireHoseRole = new Role(this, 'kinesis-firehose-service-role', kinesisFireHoseRoleProps);
+        return kinesisFireHoseRole;
+    }
+    /**
+     * @name createDeliveryStream
+     * @description - Create the delivery stream
+     * @param logBucketArn {string}
+     * @param kinesisFireHoseRole {Role["roleArn"]}
+     * @return {CfnDeliveryStream} - DeliveryStream for log messages
+     */
+   private createDeliveryStream(logBucketArn: Bucket["bucketArn"], kinesisFireHoseRoleArn: Role["roleArn"]) {
+       const deliveryStreamProps = {
+           deliveryStreamName: 'kinesis-delivery-stream',
+           extendedS3DestinationConfiguration: {
+               bucketArn: logBucketArn,
+               bufferingHints: {
+                   intervalInSeconds: 60,
+                   sizeInMBs: 50,
+               },
+               compressionFormat: "UNCOMPRESSED",
+               prefix: "firehose/",
+               roleArn: kinesisFireHoseRoleArn,
+               processingConfiguration: {
+                   enabled: true
+               }
+           }
+       };
+       const deliveryStream = new CfnDeliveryStream(this, 'log-group', deliveryStreamProps);
+       return deliveryStream;;
+   } 
+}
+// if the kinesis stream goes out, the application is borked
+
+export class CloudTrail extends Construct {
+    constructor(parent: Construct, name: string, props: CloudTrailProps) {
+        super(parent, name);
+        const {
+            trailName,
+            trailKmsName,
+            kmsAdminUserArn
+        } = props;
+        
+        const kmsIamPolicy = this.createKmsAdminPolicy(kmsAdminUserArn);
+        const trailKms = this.createTrailKms(trailKmsName, kmsIamPolicy);
+        const trail = this.createCloudTrail(trailName, trailKms);
+        trail.onCloudTrailEvent('log-to-kinesis', {
+            description: "Log to Kinesis then S3",
+        });
+        const logGroup = new LogGroup(this, 'log-group-name', {
+
+        })
+    }
+
     /**
      * @name createCloudTrail
      * @param {String} trailName
@@ -88,7 +212,7 @@ export class CloudTrail extends Construct {
                 'kms:CancelKeyDeletion'
             ],
             resources: [
-                'arn:aws:kms:{region}:{accountId}:key/*"'
+                `arn:aws:kms:${Aws.REGION}:${Aws.ACCOUNT_ID}:key/*`
             ]
         }); 
         kmsAdminPolicyDocument.addStatements(kmsAdminPolicyStatement);

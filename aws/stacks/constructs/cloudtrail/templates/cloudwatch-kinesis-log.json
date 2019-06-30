@@ -1,0 +1,123 @@
+{
+   "AWSTemplateFormatVersion": "2010-09-09",
+   "Description": "Cloudformation template for rss feed",
+   "Parameters": {},
+   "Metadata": {},
+   "Resources": {
+      "LogDeliveryStream": {
+         "Type": "AWS::KinesisFirehose::DeliveryStream",
+         "DependsOn": [
+            "LogDeliveryS3Bucket",
+            "KinesisFireHoseRole"
+         ],
+         "Properties": {
+            "ExtendedS3DestinationConfiguration": {
+               "BucketARN": null,
+               "BufferingHints": {
+                  "IntervalInSeconds": "60",
+                  "SizeInMBs": "50",
+                  "CompressionFormat": "UNCOMPRESSED",
+                  "PREFIX": "firehose/",
+                  "RoleArn": null,
+                  "ProcessingConfiguration": {
+                     "Enabled": "false"
+                  }
+               }
+            }
+         }
+      },
+      "LogDeliveryS3Bucket": {
+         "Type": "AWS::S3::Bucket",
+         "DeletionPolicy": "Retain",
+         "Properties": {
+            "BucketName": "fetch-subscriptions-log-archive",
+            "VersioningConfiguration": {
+               "Status": "Enabled"
+            }
+         }
+      },
+      "KinesisFireHoseRole": {
+         "Type": "AWS::IAM::Role",
+         "Properties": {
+            "AssumeRolePolicyDocument": {
+               "Version": "2012-10-17T00:00:00.000Z",
+               "Statement": [
+                  {
+                     "Sid": "",
+                     "Effect": "Allow",
+                     "Principal": {
+                        "Service": "firehose.amazonaws.com"
+                     },
+                     "Action": "sts:AssumeRole",
+                     "Condition": {
+                        "StringEquals": [
+                           {
+                              "sts:ExternalId": null
+                           }
+                        ]
+                     }
+                  }
+               ]
+            }
+         }
+      },
+      "LogDeliveryToS3Policy": {
+         "Type": "AWS::IAM::Policy",
+         "DependsOn": [
+            "KinesisFireHoseRole"
+         ],
+         "Properties": {
+            "PolicyName": "firehose_delivery_policy",
+            "PolicyDocument": {
+               "Version": "2012-10-17T00:00:00.000Z",
+               "Statement": [
+                  {
+                     "Effect": "Allow",
+                     "Action": [
+                        "s3:AbortMultipartUpload",
+                        "s3:GetBucketLocation",
+                        "s3:GetObject",
+                        "s3:ListBucket",
+                        "s3:ListBucketMultipartUploads",
+                        "s3:PutObject"
+                     ],
+                     "Resource": [
+                        null,
+                        null
+                     ]
+                  }
+               ],
+               "Roles": [
+                  null
+               ]
+            }
+         }
+      },
+      "FetchSubscriptionsLogGroup": {
+         "Type": "AWS::Logs::LogGroup",
+         "Properties": {
+            "LogGroupName": "FetchSubscriptionsLog",
+            "RetentionInDays": 365
+         }
+      },
+      "FetchSubscriptionsLogSubscriptionFilter": {
+         "Type": "AWS::Logs::SubscriptionFilter",
+         "DependsOn": [
+            "KinesisFireHoseRole",
+            "FetchSubscriptionsLogGroup"
+         ],
+         "Properties": {
+            "RoleArn": null,
+            "LogGroupName": null,
+            "FilterPattern": "{\n($.eventSource = \"events.amazonaws.com\") &&\n($.eventname = !Ref FetchSubscriptionsRule)\n}",
+            "DestinationArn": null
+         }
+      }
+   },
+   "Outputs": {
+      "CloudWatchLogGroupName": {
+         "Description": "Name of the CloudWatch logs",
+         "Value": null
+      }
+   }
+}
